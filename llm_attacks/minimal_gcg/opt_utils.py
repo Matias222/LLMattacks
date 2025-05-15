@@ -3,10 +3,16 @@ import gc
 import numpy as np
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from llm_attacks import get_embedding_matrix, get_embeddings
 
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",  # New format for better compression
+    bnb_4bit_compute_dtype="float16",
+    bnb_4bit_use_double_quant=True
+)
 
 def token_gradients(model, input_ids, input_slice, target_slice, loss_slice):
 
@@ -71,7 +77,7 @@ def token_gradients(model, input_ids, input_slice, target_slice, loss_slice):
 def sample_control(control_toks, grad, batch_size, topk=256, temp=1, not_allowed_tokens=None):
 
     if not_allowed_tokens is not None:
-        grad[:, not_allowed_tokens.to(grad.device)] = np.infty
+        grad[:, not_allowed_tokens.to(grad.device)] = np.inf
 
     top_indices = (-grad).topk(topk, dim=1).indices
     control_toks = control_toks.to(grad.device)
@@ -97,6 +103,9 @@ def get_filtered_cands(tokenizer, control_cand, filter_cand=True, curr_control=N
     cands, count = [], 0
     for i in range(control_cand.shape[0]):
         decoded_str = tokenizer.decode(control_cand[i], skip_special_tokens=True)
+
+        #print(decoded_str)
+
         if filter_cand:
             if decoded_str != curr_control and len(tokenizer(decoded_str, add_special_tokens=False).input_ids) == len(control_cand[i]):
                 cands.append(decoded_str)
@@ -187,6 +196,8 @@ def load_model_and_tokenizer(model_path, tokenizer_path=None, device='cuda:0', *
             model_path,
             torch_dtype=torch.float16,
             trust_remote_code=True,
+            quantization_config=bnb_config,
+            device_map="auto",
             **kwargs
         ).to(device).eval()
     
@@ -209,6 +220,13 @@ def load_model_and_tokenizer(model_path, tokenizer_path=None, device='cuda:0', *
         tokenizer.padding_side = 'left'
     if 'falcon' in tokenizer_path:
         tokenizer.padding_side = 'left'
+    if 'Llama-3.2' in tokenizer_path:
+        
+        print("Llama-3.2 Tokenizer")
+
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = 'left'
+
     if not tokenizer.pad_token:
         tokenizer.pad_token = tokenizer.eos_token
     
