@@ -65,11 +65,11 @@ class SuffixManager:
             self.conv_template.update_last_message(f"{self.target}")
             toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
 
-            print("Nombre plantilla", self.conv_template.name)
+            #print("Nombre plantilla", self.conv_template.name)
 
             if(self.conv_template.name == "llama-3.2"):
                 
-                print("Llama 3.2 en cadena")
+                #print("Llama 3.2 en cadena",end='\n')
 
                 self._target_slice = slice(self._assistant_role_slice.stop, len(toks))
                 self._loss_slice = slice(self._assistant_role_slice.stop-1, len(toks)-1)

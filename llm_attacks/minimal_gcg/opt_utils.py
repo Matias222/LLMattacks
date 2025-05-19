@@ -76,19 +76,32 @@ def token_gradients(model, input_ids, input_slice, target_slice, loss_slice):
 
 def sample_control(control_toks, grad, batch_size, topk=256, temp=1, not_allowed_tokens=None):
 
+    #print("OYEEEEE")
+
     if not_allowed_tokens is not None:
         grad[:, not_allowed_tokens.to(grad.device)] = np.inf
+
+    #print(control_toks.shape)
+    #print(len(control_toks),batch_size)
 
     top_indices = (-grad).topk(topk, dim=1).indices
     control_toks = control_toks.to(grad.device)
 
     original_control_toks = control_toks.repeat(batch_size, 1)
+
     new_token_pos = torch.arange(
         0, 
         len(control_toks), 
         len(control_toks) / batch_size,
         device=grad.device
     ).type(torch.int64)
+
+    #print(new_token_pos)
+    #print(len(new_token_pos))
+    #print(top_indices)
+    #print(top_indices.shape)
+
+
     new_token_val = torch.gather(
         top_indices[new_token_pos], 1, 
         torch.randint(0, topk, (batch_size, 1),
@@ -102,17 +115,18 @@ def sample_control(control_toks, grad, batch_size, topk=256, temp=1, not_allowed
 def get_filtered_cands(tokenizer, control_cand, filter_cand=True, curr_control=None):
     cands, count = [], 0
     for i in range(control_cand.shape[0]):
+        #print(control_cand[i][:26].shape)
         decoded_str = tokenizer.decode(control_cand[i], skip_special_tokens=True)
 
         #print(decoded_str)
 
         if filter_cand:
             if decoded_str != curr_control and len(tokenizer(decoded_str, add_special_tokens=False).input_ids) == len(control_cand[i]):
-                cands.append(decoded_str)
+                cands.append(decoded_str.strip())
             else:
                 count += 1
         else:
-            cands.append(decoded_str)
+            cands.append(decoded_str.strip())
 
     if filter_cand:
         cands = cands + [cands[-1]] * (len(control_cand) - len(cands))
@@ -122,6 +136,8 @@ def get_filtered_cands(tokenizer, control_cand, filter_cand=True, curr_control=N
 
 def get_logits(*, model, tokenizer, input_ids, control_slice, test_controls=None, return_ids=False, batch_size=512):
     
+    print("Batch size",batch_size)
+
     if isinstance(test_controls[0], str):
         max_len = control_slice.stop - control_slice.start
         test_ids = [
