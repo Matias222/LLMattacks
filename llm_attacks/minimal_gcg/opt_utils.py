@@ -26,7 +26,7 @@ def token_gradients(model, input_ids, input_slice, target_slice, loss_slice):
     input_ids : torch.Tensor
         The input sequence in the form of token ids.
     input_slice : slice
-        The slice of the input sequence for which gradients need to be computed.
+        The slice of the input sequence for which gradients need to be computed. -> Adversarial suffix
     target_slice : slice
         The slice of the input sequence to be used as targets.
     loss_slice : slice
@@ -39,6 +39,10 @@ def token_gradients(model, input_ids, input_slice, target_slice, loss_slice):
     """
 
     embed_weights = get_embedding_matrix(model)
+    
+    #print(embed_weights.shape)
+    #print(input_ids[input_slice].shape[0],embed_weights.shape[0])
+
     one_hot = torch.zeros(
         input_ids[input_slice].shape[0],
         embed_weights.shape[0],
@@ -51,15 +55,17 @@ def token_gradients(model, input_ids, input_slice, target_slice, loss_slice):
         torch.ones(one_hot.shape[0], 1, device=model.device, dtype=embed_weights.dtype)
     )
     one_hot.requires_grad_()
-    input_embeds = (one_hot @ embed_weights).unsqueeze(0)
+    input_embeds = (one_hot @ embed_weights).unsqueeze(0) #proyeccion a las dimensiones del embedding
     
+    #print(input_embeds.shape)
+
     # now stitch it together with the rest of the embeddings
-    embeds = get_embeddings(model, input_ids.unsqueeze(0)).detach()
+    embeds = get_embeddings(model, input_ids.unsqueeze(0)).detach() #embedding originales
     full_embeds = torch.cat(
         [
-            embeds[:,:input_slice.start,:], 
-            input_embeds, 
-            embeds[:,input_slice.stop:,:]
+            embeds[:,:input_slice.start,:], #Embeddings before suffix
+            input_embeds, #Nuevos embeddings del sufijo
+            embeds[:,input_slice.stop:,:] #Embeddings despues
         ], 
         dim=1)
     
@@ -70,13 +76,64 @@ def token_gradients(model, input_ids, input_slice, target_slice, loss_slice):
     loss.backward()
     
     grad = one_hot.grad.clone()
-    grad = grad / grad.norm(dim=-1, keepdim=True)
+    grad = grad / grad.norm(dim=-1, keepdim=True) #[adv length,vocab size], direccion de la gradiente para cada uno de los tokens del vocab
     
+    #print(grad.shape)
+
     return grad
 
-def sample_control(control_toks, grad, batch_size, topk=256, temp=1, not_allowed_tokens=None):
+def sample_control_all_tokens(control_toks, grad, batch_size, topk=256, temp=1, not_allowed_tokens=None):
 
-    #print("OYEEEEE")
+    if not_allowed_tokens is not None:
+        grad[:, not_allowed_tokens.to(grad.device)] = np.inf  # prevent them from being selected
+
+    top_indices = (-grad).topk(topk, dim=1).indices     # [seq_len, topk]
+    seq_len = control_toks.shape[0]
+    control_toks = control_toks.to(grad.device)
+
+    #for i in range(top_indices.shape[0]):
+    #    print(top_indices[i])
+    #    continue
+
+    #for i in range(seq_len):
+    #    for j in range(seq_len):
+    #        if not torch.equal(top_indices[i], top_indices[j]):
+    #            print("ACAAA",i,j)
+
+    #torch.set_printoptions(threshold=float('inf'))
+    #print(top_indices)
+
+    #print(top_indices)
+
+    # Repeat the original tokens across the batch
+    original_control_toks = control_toks.unsqueeze(0).repeat(batch_size, 1)  # [batch_size, seq_len]
+
+    #print(original_control_toks)
+
+    # Generate random indices from 0 to topk-1 for each token in each batch
+    rand_idx = torch.randint(0, topk, (batch_size, seq_len), device=grad.device)  # [batch_size, seq_len]
+
+    #print(rand_idx)
+    #print(rand_idx.shape)
+
+    # Expand top_indices to [batch_size, seq_len, topk]
+    top_indices_exp = top_indices.unsqueeze(0).expand(batch_size, -1, -1)  # [batch_size, seq_len, topk]
+
+    #print(top_indices)
+    #print("*"*50)
+    #print(top_indices_exp)
+
+    # Use gather to select one random token from topk for each position in each sequence
+    rand_replacements = torch.gather(top_indices_exp, 2, rand_idx.unsqueeze(-1)).squeeze(-1)  # [batch_size, seq_len]
+
+    
+
+    #print(rand_replacements)
+
+    return rand_replacements
+
+
+def sample_control(control_toks, grad, batch_size, topk=256, temp=1, not_allowed_tokens=None):
 
     if not_allowed_tokens is not None:
         grad[:, not_allowed_tokens.to(grad.device)] = np.inf
@@ -85,6 +142,7 @@ def sample_control(control_toks, grad, batch_size, topk=256, temp=1, not_allowed
     #print(len(control_toks),batch_size)
 
     top_indices = (-grad).topk(topk, dim=1).indices
+
     control_toks = control_toks.to(grad.device)
 
     original_control_toks = control_toks.repeat(batch_size, 1)
@@ -96,18 +154,20 @@ def sample_control(control_toks, grad, batch_size, topk=256, temp=1, not_allowed
         device=grad.device
     ).type(torch.int64)
 
-    #print(new_token_pos)
-    #print(len(new_token_pos))
-    #print(top_indices)
-    #print(top_indices.shape)
-
-
-    new_token_val = torch.gather(
-        top_indices[new_token_pos], 1, 
+    new_token_val = torch.gather(  #Para cada batch eligue un random
+        top_indices[new_token_pos],  # [batch_size, topk] (el adv_length esta colapsado)
+        1, 
         torch.randint(0, topk, (batch_size, 1),
         device=grad.device)
     )
+
+
     new_control_toks = original_control_toks.scatter_(1, new_token_pos.unsqueeze(-1), new_token_val)
+
+    #Lo que realmente esta haciendo, es diviendo las cadenas en batch/seq_length, queda algo de 5 reemplazos por posicion
+    #Entonces para cada indice de seq_length, vamos a tener 5 posibles reemplazos en un espacio muestral de 256!
+
+    #print(new_control_toks)
 
     return new_control_toks
 
@@ -119,6 +179,7 @@ def get_filtered_cands(tokenizer, control_cand, filter_cand=True, curr_control=N
         decoded_str = tokenizer.decode(control_cand[i], skip_special_tokens=True)
 
         #print(decoded_str)
+        #print("*"*50)
 
         if filter_cand:
             if decoded_str != curr_control and len(tokenizer(decoded_str, add_special_tokens=False).input_ids) == len(control_cand[i]):
