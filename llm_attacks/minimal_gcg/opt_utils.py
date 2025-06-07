@@ -3,6 +3,8 @@ import gc
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from llm_attacks import get_embedding_matrix, get_embeddings
@@ -81,6 +83,56 @@ def token_gradients(model, input_ids, input_slice, target_slice, loss_slice):
     #print(grad.shape)
 
     return grad
+
+def sample_control_all_tokens_cosine(model,control_toks, grad, batch_size, topk=256, temp=1, not_allowed_tokens=None):
+
+    if not_allowed_tokens is not None:
+        grad[:, not_allowed_tokens.to(grad.device)] = np.inf
+
+    embed_weights = get_embedding_matrix(model)
+
+    seq_len = control_toks.shape[0]
+    vocab_size = grad.shape[1]
+
+    # ── 2. Top-k candidates for every position ─────────────────────
+    top_idx = (-grad).topk(topk, dim=1).indices         # [seq_len, topk]
+
+    # ── 3. Sample one candidate per (batch,row) uniformly in [0,k) ─
+    rand_idx        = torch.randint(0, topk, (batch_size, seq_len), device=grad.device)
+    top_idx_exp     = top_idx.unsqueeze(0).expand(batch_size, -1, -1)   # [B,S,k]
+    repl_tokens     = torch.gather(top_idx_exp, 2, rand_idx.unsqueeze(-1)).squeeze(-1)  # [B,S]
+
+
+    # ── 4. Get embeddings (orig & replacement) ─────────────────────
+
+    emb_orig = get_embeddings(model, control_toks).detach() #embedding originales
+    emb_repl = get_embeddings(model, repl_tokens).detach() #embedding originales
+
+
+    emb_orig=emb_orig.unsqueeze(0).expand(batch_size, -1, -1)
+
+    print(emb_orig.shape)
+    print(emb_repl.shape)
+    #print()
+
+    diff_emb = F.normalize(emb_orig - emb_repl, dim=2)                        # [B,S,D]
+ 
+    print(diff_emb.shape)
+    print(embed_weights.shape)
+
+    logits = diff_emb @ embed_weights.T      # [B,S,V]
+    
+    if not_allowed_tokens is not None:
+        logits[:, :, not_allowed_tokens.to(grad.device)] = -np.inf
+    
+    print("ACA ESTAMOS",logits.shape)
+
+    new_tokens  = logits.argmax(dim=-1).long()                 # [B,S]
+
+    print(control_toks[0])
+    print(new_tokens[0])
+
+    return new_tokens
 
 def sample_control_all_tokens(control_toks, grad, batch_size, topk=256, temp=1, not_allowed_tokens=None):
 
@@ -176,7 +228,7 @@ def get_filtered_cands(tokenizer, control_cand, filter_cand=True, curr_control=N
     cands, count = [], 0
     for i in range(control_cand.shape[0]):
         #print(control_cand[i][:26].shape)
-        decoded_str = tokenizer.decode(control_cand[i], skip_special_tokens=True)
+        decoded_str = tokenizer.decode(control_cand[i][:100], skip_special_tokens=True)
 
         #print(decoded_str)
         #print("*"*50)
@@ -202,7 +254,7 @@ def get_logits(*, model, tokenizer, input_ids, control_slice, test_controls=None
     if isinstance(test_controls[0], str):
         max_len = control_slice.stop - control_slice.start
         test_ids = [
-            torch.tensor(tokenizer(control, add_special_tokens=False).input_ids[:max_len], device=model.device)
+            torch.tensor(tokenizer(control, add_special_tokens=False).input_ids[:max_len], device=model.device) #reemplazando en la seccion adversarial del prompt
             for control in test_controls
         ]
         pad_tok = 0
@@ -263,10 +315,22 @@ def forward(*, model, input_ids, attention_mask, batch_size=512):
 
 def target_loss(logits, ids, target_slice):
     crit = nn.CrossEntropyLoss(reduction='none')
+    target_len = target_slice.stop - target_slice.start
     loss_slice = slice(target_slice.start-1, target_slice.stop-1)
     loss = crit(logits[:,loss_slice,:].transpose(1,2), ids[:,target_slice])
-    return loss.mean(dim=-1)
 
+    #probemos con el decay
+
+    #print(loss.shape)
+
+    return loss.mean(dim=-1) #Esta sacando el promedio pero el loss mas importante es el primero y asi y asi
+
+    weights = torch.exp(-0.1 * torch.arange(target_len)).to(loss.device)
+    weights = weights / weights.sum()
+
+    weighted_loss = (loss * weights.unsqueeze(0)).sum(dim=1)  # shape: (batch_size), esta metrica no funciona, no llega a encontrar la cadena inicial, tal vez porque el desfase sea muy achorado? en ese caso veriamos cambios en el primer token, e igual tenemos I
+
+    return weighted_loss
 
 def load_model_and_tokenizer(model_path, tokenizer_path=None, device='cuda:0', **kwargs):
     model = AutoModelForCausalLM.from_pretrained(
