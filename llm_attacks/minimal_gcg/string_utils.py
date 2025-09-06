@@ -147,7 +147,7 @@ class SuffixManager:
     def get_input_ids(self, adv_string=None):
         prompt = self.get_prompt(adv_string=adv_string)
         
-        print(prompt)
+        print("IMPRIMIENDO PROMPT",prompt)
         
         toks = self.tokenizer(prompt).input_ids
         input_ids = torch.tensor(toks[:self._target_slice.stop])

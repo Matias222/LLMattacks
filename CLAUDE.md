@@ -1,0 +1,1 @@
+Para este proyecto necesito que entiendas muy bien como funciona SuffixManager de llm_attacks/minimal_gcg_string_utils.py
