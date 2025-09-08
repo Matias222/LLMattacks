@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(/C:\\Users\\matia\\desktop\\tesis\\llm-attacks\\embedding_attacks/**)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
