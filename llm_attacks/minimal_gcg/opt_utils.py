@@ -16,11 +16,11 @@ bnb_config = BitsAndBytesConfig(
     bnb_4bit_use_double_quant=True
 )
 
-def token_gradients(model, input_ids, input_slice, target_slice, loss_slice):
+def token_gradients(model, input_ids, input_slice, target_slice, loss_slice, reg_weight=0.0):
 
     """
     Computes gradients of the loss with respect to the coordinates.
-    
+
     Parameters
     ----------
     model : Transformer Model
@@ -33,17 +33,17 @@ def token_gradients(model, input_ids, input_slice, target_slice, loss_slice):
         The slice of the input sequence to be used as targets.
     loss_slice : slice
         The slice of the logits to be used for computing the loss.
+    reg_weight : float
+        Regularization weight for Faster-GCG Technique 1 (default: 0.0 for original GCG)
 
     Returns
     -------
     torch.Tensor
         The gradients of each token in the input_slice with respect to the loss.
+        If reg_weight > 0, also returns regularized gradients.
     """
 
     embed_weights = get_embedding_matrix(model)
-    
-    #print(embed_weights.shape)
-    #print(input_ids[input_slice].shape[0],embed_weights.shape[0])
 
     one_hot = torch.zeros(
         input_ids[input_slice].shape[0],
@@ -52,14 +52,12 @@ def token_gradients(model, input_ids, input_slice, target_slice, loss_slice):
         dtype=embed_weights.dtype
     )
     one_hot.scatter_(
-        1, 
+        1,
         input_ids[input_slice].unsqueeze(1),
         torch.ones(one_hot.shape[0], 1, device=model.device, dtype=embed_weights.dtype)
     )
     one_hot.requires_grad_()
     input_embeds = (one_hot @ embed_weights).unsqueeze(0) #proyeccion a las dimensiones del embedding
-    
-    #print(input_embeds.shape)
 
     # now stitch it together with the rest of the embeddings
     embeds = get_embeddings(model, input_ids.unsqueeze(0)).detach() #embedding originales
@@ -68,19 +66,34 @@ def token_gradients(model, input_ids, input_slice, target_slice, loss_slice):
             embeds[:,:input_slice.start,:], #Embeddings before suffix
             input_embeds, #Nuevos embeddings del sufijo
             embeds[:,input_slice.stop:,:] #Embeddings despues
-        ], 
+        ],
         dim=1)
-    
+
     logits = model(inputs_embeds=full_embeds).logits
     targets = input_ids[target_slice]
     loss = nn.CrossEntropyLoss()(logits[0,loss_slice,:], targets)
-    
+
     loss.backward()
-    
+
     grad = one_hot.grad.clone()
     grad = grad / grad.norm(dim=-1, keepdim=True) #[adv length,vocab size], direccion de la gradiente para cada uno de los tokens del vocab
-    
-    #print(grad.shape)
+
+    # Faster-GCG Technique 1: Add distance regularization
+    if reg_weight > 0:
+        # Get current token embeddings
+        current_token_ids = input_ids[input_slice]  # [seq_len]
+        current_embeds = embed_weights[current_token_ids]  # [seq_len, embed_dim]
+
+        # Compute L2 distance from current tokens to all tokens in vocab
+        # current_embeds: [seq_len, embed_dim]
+        # embed_weights: [vocab_size, embed_dim]
+        # distances: [seq_len, vocab_size]
+        distances = torch.cdist(current_embeds.unsqueeze(0), embed_weights.unsqueeze(0), p=2).squeeze(0)
+
+        # Add regularization term: ĝ_k = ∂L/∂e_k + w · ||X_j - X_k||
+        grad_regularized = grad + reg_weight * distances
+
+        return grad_regularized
 
     return grad
 
@@ -186,12 +199,12 @@ def sample_control_all_tokens(control_toks, grad, batch_size, topk=256, temp=1, 
 
 
 def sample_control(control_toks, grad, batch_size, topk=256, temp=1, not_allowed_tokens=None):
-
+    """
+    Original GCG sampling: Random sampling from top-K candidates.
+    This replaces ONE token per candidate sequence.
+    """
     if not_allowed_tokens is not None:
         grad[:, not_allowed_tokens.to(grad.device)] = np.inf
-
-    #print(control_toks.shape)
-    #print(len(control_toks),batch_size)
 
     top_indices = (-grad).topk(topk, dim=1).indices
 
@@ -200,26 +213,51 @@ def sample_control(control_toks, grad, batch_size, topk=256, temp=1, not_allowed
     original_control_toks = control_toks.repeat(batch_size, 1)
 
     new_token_pos = torch.arange(
-        0, 
-        len(control_toks), 
+        0,
+        len(control_toks),
         len(control_toks) / batch_size,
         device=grad.device
     ).type(torch.int64)
 
     new_token_val = torch.gather(  #Para cada batch eligue un random
         top_indices[new_token_pos],  # [batch_size, topk] (el adv_length esta colapsado)
-        1, 
+        1,
         torch.randint(0, topk, (batch_size, 1),
         device=grad.device)
     )
 
-
     new_control_toks = original_control_toks.scatter_(1, new_token_pos.unsqueeze(-1), new_token_val)
 
-    #Lo que realmente esta haciendo, es diviendo las cadenas en batch/seq_length, queda algo de 5 reemplazos por posicion
-    #Entonces para cada indice de seq_length, vamos a tener 5 posibles reemplazos en un espacio muestral de 256!
+    return new_control_toks
 
-    #print(new_control_toks)
+
+def sample_control_greedy(control_toks, grad, batch_size, topk=256, temp=1, not_allowed_tokens=None):
+    """
+    Faster-GCG Technique 2: Greedy sampling instead of random sampling.
+    Deterministically selects candidates from best to worst according to gradient.
+    """
+    if not_allowed_tokens is not None:
+        grad[:, not_allowed_tokens.to(grad.device)] = np.inf
+
+    # Get top-k indices for each position: [seq_len, topk]
+    top_indices = (-grad).topk(topk, dim=1).indices
+
+    seq_len = control_toks.shape[0]
+    control_toks = control_toks.to(grad.device)
+
+    # Create batch_size candidates
+    new_control_toks = control_toks.unsqueeze(0).repeat(batch_size, 1)  # [batch_size, seq_len]
+
+    # For each candidate in the batch, replace ONE token greedily
+    # We cycle through positions and select from top-k in order (greedy)
+    for b in range(batch_size):
+        # Determine which position to modify for this batch item
+        pos = b % seq_len
+        # Determine which rank in top-k to use (0 = best, 1 = 2nd best, etc.)
+        rank = (b // seq_len) % topk
+
+        # Replace token at position `pos` with the `rank`-th best candidate
+        new_control_toks[b, pos] = top_indices[pos, rank]
 
     return new_control_toks
 
