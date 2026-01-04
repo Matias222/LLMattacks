@@ -19,7 +19,6 @@ def load_conversation_template(template_name):
         
         return conv_template
 
-
 class SuffixManager:
     def __init__(self, *, tokenizer, conv_template, instruction, target, adv_string):
 
@@ -42,7 +41,6 @@ class SuffixManager:
         toks = encoding.input_ids
 
         if self.conv_template.name == 'llama-2' or self.conv_template.name == 'llama-3.2':
-            
             self.conv_template.messages = []
 
             self.conv_template.append_message(self.conv_template.roles[0], None)
@@ -64,19 +62,14 @@ class SuffixManager:
 
             self.conv_template.update_last_message(f"{self.target}")
             toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
-
-            #print("Nombre plantilla", self.conv_template.name)
-
+            
             if(self.conv_template.name == "llama-3.2"):
-                
-                #print("Llama 3.2 en cadena",end='\n')
-
                 self._target_slice = slice(self._assistant_role_slice.stop, len(toks))
                 self._loss_slice = slice(self._assistant_role_slice.stop-1, len(toks)-1)
             else:
                 self._target_slice = slice(self._assistant_role_slice.stop, len(toks)-2)
                 self._loss_slice = slice(self._assistant_role_slice.stop-1, len(toks)-3)
-                
+            
         else:
             python_tokenizer = False or self.conv_template.name == 'oasst_pythia'
             try:
@@ -146,10 +139,8 @@ class SuffixManager:
     
     def get_input_ids(self, adv_string=None):
         prompt = self.get_prompt(adv_string=adv_string)
-        
-        print(prompt)
-        
         toks = self.tokenizer(prompt).input_ids
         input_ids = torch.tensor(toks[:self._target_slice.stop])
 
         return input_ids
+

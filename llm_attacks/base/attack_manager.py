@@ -3,6 +3,9 @@ import json
 import math
 import random
 import time
+import re
+import unicodedata
+
 from copy import deepcopy
 from typing import Optional, Any
 
@@ -58,6 +61,14 @@ def get_embeddings(model, input_ids):
     else:
         raise ValueError(f"Unknown model type: {type(model)}")
 
+# Require at least one French accented char / ligature to be considered "French"
+_FR_ACCENTS = "ÀÂÄÆÇÉÈÊËÎÏÔÖŒÙÛÜŸàâäæçéèêëîïôöœùûüÿ"
+_HAS_FR_ACCENT = re.compile(f"[{_FR_ACCENTS}]")
+
+# Glue you probably want to allow across languages
+_GLUE = set("-/()[]{}.,:;!?'\"|\\\u2581 «» …")  # includes ▁ (SentencePiece), guillemets, ellipsis
+_GLUE.add("\u00A0")  # non-breaking space used in FR typography
+
 def get_nonascii_toks(tokenizer, device='cpu'):
 
     def is_ascii(s):
@@ -78,6 +89,174 @@ def get_nonascii_toks(tokenizer, device='cpu'):
         ascii_toks.append(tokenizer.unk_token_id)
     
     return torch.tensor(ascii_toks, device=device)
+
+def get_nonfrench_toks_strict(tokenizer, device='cpu', keep_glue=True, block_special=True):
+    """
+    Blocklist for a *French-only* search space:
+    - ALLOW tokens that contain ≥1 French accented/ligatured character.
+    - Optionally ALLOW glue-only tokens (digits/whitespace/punctuation).
+    - BLOCK everything else (including plain a–z English-looking tokens).
+    - Optionally BLOCK special tokens too.
+    """
+    blocked = []
+    for i in range(tokenizer.vocab_size):
+        s = tokenizer.decode([i])
+
+        # undecodable / empty -> block
+        if not s:
+            blocked.append(i)
+            continue
+
+        # allow if it has at least one FR accented char
+        if _HAS_FR_ACCENT.search(s):
+            continue
+
+        # optionally allow "glue-only" tokens (digits, whitespace, common punct)
+        if keep_glue and all(ch.isdigit() or ch.isspace() or ch in _GLUE for ch in s):
+            continue
+
+        # otherwise: block
+        blocked.append(i)
+
+    if block_special:
+        for sid in [tokenizer.bos_token_id, tokenizer.eos_token_id,
+                    tokenizer.pad_token_id, tokenizer.unk_token_id]:
+            if sid is not None and sid not in blocked:
+                blocked.append(sid)
+
+    return torch.tensor(sorted(set(blocked)), device=device)
+
+def get_nonchinese_toks(tokenizer, device='cpu', allow_punct_space_digits=True):
+    # Chinese ranges (CJK + extensions + compatibility)
+    chinese_pattern = re.compile(
+        r'['
+        r'\u3400-\u4DBF'          # CJK Ext A
+        r'\u4E00-\u9FFF'          # CJK Unified Ideographs
+        r'\uF900-\uFAFF'          # CJK Compatibility Ideographs
+        r'\U00020000-\U0002A6DF'  # Ext B
+        r'\U0002A700-\U0002B73F'  # Ext C
+        r'\U0002B740-\U0002B81F'  # Ext D
+        r'\U0002B820-\U0002CEAF'  # Ext E
+        r'\U0002CEB0-\U0002EBEF'  # Ext F
+        r'\U00030000-\U0003134F'  # Ext G
+        r'\U0002EBF0-\U0002EE5F'  # Ext H
+        r'\U0002F800-\U0002FA1F'  # Compat Ideographs Supplement
+        r']'
+    )
+
+    # Extras we may allow so generation remains sane (optional)
+    allowed_extras = set("-/()[]{}.,:;!?'\"|\\")
+    allowed_extras.add('\u2581')  # SentencePiece word boundary ▁
+
+    toks = []
+    for i in range(tokenizer.vocab_size):
+        s = tokenizer.decode([i])
+
+        # block empty decodes
+        if not s:
+            toks.append(i)
+            continue
+
+        # allow if token contains ANY Chinese char
+        if chinese_pattern.search(s):
+            continue
+
+        # optionally allow tokens made only of digits/whitespace/punctuation
+        if allow_punct_space_digits and all(
+            ch.isdigit() or ch.isspace() or ch in allowed_extras for ch in s
+        ):
+            continue
+
+        # otherwise: block it
+        toks.append(i)
+
+    # EXPLICITLY block special tokens too
+    for sid in [tokenizer.bos_token_id, tokenizer.eos_token_id,
+                tokenizer.pad_token_id, tokenizer.unk_token_id]:
+        if sid is not None and sid not in toks:
+            toks.append(sid)
+
+    toks = sorted(set(toks))
+    return torch.tensor(toks, device=device)
+
+def get_nonascii_toks_ruso(tokenizer, device='cpu'):
+    # Regex para caracteres cirílicos
+    cyrillic_pattern = re.compile(r'[\u0400-\u04FF]')
+
+    # Caracteres que queremos excluir explícitamente
+    excluded_chars = set([
+        "-", "/", "(", ")", "[", "]", "{", "}", 
+        ".", ",", ":", ";", "!", "?", "'", '"', "|", "\\"
+    ])
+
+    toks = []
+    for i in range(3, tokenizer.vocab_size):
+        decoded = tokenizer.decode([i])
+        
+        # condiciones de exclusión
+        if (
+            (decoded in excluded_chars)  # símbolos prohibidos
+            or cyrillic_pattern.search(decoded)  # cirílico
+        ):
+            continue
+        
+        toks.append(i)
+
+    # incluir tokens especiales
+    for special_id in [tokenizer.bos_token_id, tokenizer.eos_token_id,
+                       tokenizer.pad_token_id, tokenizer.unk_token_id]:
+        if special_id is not None and special_id not in toks:
+            toks.append(special_id)
+
+    return torch.tensor(toks, device=device)
+
+#def get_nonascii_toks(tokenizer, device='cpu'):
+#
+#    print("Nueva non ascii and emoji")
+#
+#    def is_ascii(s):
+#        return s.isascii() and s.isprintable()
+#
+#    def is_emoji(s):
+#        # Regular expression pattern to match emojis
+#        emoji_pattern = re.compile(
+#            "[\U0001F600-\U0001F64F"  # Emoticons
+#            "\U0001F300-\U0001F5FF"  # Misc Symbols and Pictographs
+#            "\U0001F680-\U0001F6FF"  # Transport & Map
+#            "\U0001F700-\U0001F77F"  # Alchemical Symbols
+#            "\U0001F780-\U0001F7FF"  # Geometric Shapes
+#            "\U0001F800-\U0001F8FF"  # Supplemental Arrows-B
+#            "\U0001F900-\U0001F9FF"  # Supplemental Symbols and Pictographs
+#            "\U0001FA00-\U0001FA6F"  # Chess Symbols, Symbols for Life
+#            "\U0001FA70-\U0001FAFF"  # Symbols for Fencing, Weather
+#            "\U00002600-\U000027BF"  # Misc symbols
+#            "\U0001F200-\U0001F251"  # Enclosed characters
+#            "\U0001F004-\U0001F0CF"  # Playing Cards
+#            "\U0001F000-\U0001F02F"  # Mahjong Tiles
+#            "\U0001F0A0-\U0001F0FF"  # Tarot Cards
+#            "]+", re.UNICODE)
+#        
+#        return bool(emoji_pattern.search(s))
+#
+#    nonascii_toks = []
+#    
+#    for i in range(3, tokenizer.vocab_size):
+#    
+#        tok = tokenizer.decode([i])
+#    
+#        if not is_emoji(tok) and not is_ascii(tok):
+#    
+#            nonascii_toks.append(i)
+#
+#    # Include special tokens if desired
+#    for special_id in (tokenizer.bos_token_id,
+#                       tokenizer.eos_token_id,
+#                       tokenizer.pad_token_id,
+#                       tokenizer.unk_token_id):
+#        if special_id is not None:
+#            nonascii_toks.append(special_id)
+#
+#    return torch.tensor(nonascii_toks, device=device)
 
 class AttackPrompt(object):
     """

@@ -80,8 +80,6 @@ def token_gradients(model, input_ids, input_slice, target_slice, loss_slice):
     grad = one_hot.grad.clone()
     grad = grad / grad.norm(dim=-1, keepdim=True) #[adv length,vocab size], direccion de la gradiente para cada uno de los tokens del vocab
     
-    #print(grad.shape)
-
     return grad
 
 def sample_control_all_tokens_cosine(model,control_toks, grad, batch_size, topk=256, temp=1, not_allowed_tokens=None):
@@ -223,15 +221,11 @@ def sample_control(control_toks, grad, batch_size, topk=256, temp=1, not_allowed
 
     return new_control_toks
 
-
 def get_filtered_cands(tokenizer, control_cand, filter_cand=True, curr_control=None):
     cands, count = [], 0
     for i in range(control_cand.shape[0]):
-        #print(control_cand[i][:26].shape)
-        decoded_str = tokenizer.decode(control_cand[i][:100], skip_special_tokens=True)
-
-        #print(decoded_str)
-        #print("*"*50)
+        
+        decoded_str = tokenizer.decode(control_cand[i][:80], skip_special_tokens=True)
 
         if filter_cand:
             if decoded_str != curr_control and len(tokenizer(decoded_str, add_special_tokens=False).input_ids) == len(control_cand[i]):
